@@ -1,0 +1,363 @@
+#include "PDOGS.hpp"       // 确保 Feis 命名空间可见
+#include <vector>
+#include <queue>
+#include <algorithm>
+#include <functional>
+#include <climits>
+#include <unordered_map>
+
+class GamePlayer final : public Feis::IGamePlayer {
+private:
+    struct Action { Feis::PlayerActionType type; Feis::CellPosition pos; };
+    std::vector<Action> actions_;
+    size_t              action_index_ = 0;
+    bool                initialized_  = false;
+
+    using Pos = Feis::CellPosition;
+    static constexpr int H = Feis::GameManagerConfig::kBoardHeight;
+    static constexpr int W = Feis::GameManagerConfig::kBoardWidth;
+    static constexpr int G = Feis::GameManagerConfig::kGoalSize;
+    inline static constexpr std::array<Feis::Direction,4> dirs = {
+        Feis::Direction::kLeft,
+        Feis::Direction::kTop,
+        Feis::Direction::kRight,
+        Feis::Direction::kBottom
+    };
+
+    inline int idx(Pos p) const { return p.row * W + p.col; }
+
+    Feis::PlayerActionType MachineType(Feis::Direction d) const {
+        switch (d) {
+            case Feis::Direction::kLeft:   return Feis::PlayerActionType::BuildLeftOutMiningMachine;
+            case Feis::Direction::kTop:    return Feis::PlayerActionType::BuildTopOutMiningMachine;
+            case Feis::Direction::kRight:  return Feis::PlayerActionType::BuildRightOutMiningMachine;
+            case Feis::Direction::kBottom: return Feis::PlayerActionType::BuildBottomOutMiningMachine;
+        }
+        return Feis::PlayerActionType::None;
+    }
+    Feis::PlayerActionType ConveyorType(Feis::Direction d) const {
+        switch (d) {
+            case Feis::Direction::kLeft:   return Feis::PlayerActionType::BuildRightToLeftConveyor;
+            case Feis::Direction::kTop:    return Feis::PlayerActionType::BuildBottomToTopConveyor;
+            case Feis::Direction::kRight:  return Feis::PlayerActionType::BuildLeftToRightConveyor;
+            case Feis::Direction::kBottom: return Feis::PlayerActionType::BuildTopToBottomConveyor;
+        }
+        return Feis::PlayerActionType::None;
+    }
+    Feis::PlayerActionType CombinerType(Feis::Direction d) const {
+        switch (d) {
+            case Feis::Direction::kLeft:   return Feis::PlayerActionType::BuildLeftOutCombiner;
+            case Feis::Direction::kTop:    return Feis::PlayerActionType::BuildTopOutCombiner;
+            case Feis::Direction::kRight:  return Feis::PlayerActionType::BuildRightOutCombiner;
+            case Feis::Direction::kBottom: return Feis::PlayerActionType::BuildBottomOutCombiner;
+        }
+        return Feis::PlayerActionType::None;
+    }
+
+    // 1) 收集所有中心入口
+    std::vector<std::pair<Pos,Pos>> GetCenterEntrances(const Feis::IGameInfo& info) {
+        std::vector<std::pair<Pos,Pos>> centerEntrances;
+        int top  = Feis::GameManager::CollectionCenterConfig::kTop;
+        int left = Feis::GameManager::CollectionCenterConfig::kLeft;
+        for (int r = top; r < top + G; ++r) {
+            for (int c = left; c < left + G; ++c) {
+                Pos cc{r, c};
+                for (auto d : dirs) {
+                    Pos nb = Feis::GetNeighborCellPosition(cc, d);
+                    if (Feis::IsWithinBoard(nb) && !info.GetLayeredCell(nb).GetForeground()) {
+                        centerEntrances.emplace_back(nb, cc);
+                    }
+                }
+            }
+        }
+        std::sort(centerEntrances.begin(), centerEntrances.end(),
+                  [](auto &a, auto &b){
+                      if (a.first.row != b.first.row) return a.first.row < b.first.row;
+                      return a.first.col < b.first.col;
+                  });
+        centerEntrances.erase(
+            std::unique(centerEntrances.begin(), centerEntrances.end(),
+                        [](auto &a, auto &b){ return a.first == b.first; }),
+            centerEntrances.end());
+        return centerEntrances;
+    }
+
+    // 2) scan valid mines, 并把不可单独得分者装入 cbmines
+    std::vector<Pos> GetScoredMines(
+        const Feis::IGameInfo& info,
+        std::vector<Pos>& cbmines)
+    {
+        int top  = Feis::GameManager::CollectionCenterConfig::kTop;
+        int left = Feis::GameManager::CollectionCenterConfig::kLeft;
+        Pos center{ top + G/2, left + G/2 };
+
+        std::vector<Pos> mines;
+        for (int r = 0; r < H; ++r) {
+            for (int c = 0; c < W; ++c) {
+                Pos p{r,c};
+                if (auto bg = info.GetLayeredCell(p).GetBackground()) {
+                    if (auto num = dynamic_cast<const Feis::NumberCell*>(bg.get())) {
+                        if (info.IsScoredProduct(num->GetNumber())) {
+                            mines.push_back(p);
+                        } else {
+                            cbmines.push_back(p);
+                        }
+                    }
+                }
+            }
+        }
+        std::sort(mines.begin(), mines.end(),
+                  [&](const Pos &a, const Pos &b){
+                      int da = abs(a.row-center.row) + abs(a.col-center.col);
+                      int db = abs(b.row-center.row) + abs(b.col-center.col);
+                      return da < db;
+                  });
+        return mines;
+    }
+
+    // 3) BFS from src to dst, excluding src
+    std::vector<Pos> bfsBetween(const Feis::IGameInfo& info, Pos src, Pos dst) {
+        std::vector<int> dist(H*W, -1);
+        std::vector<Pos> prev(H*W);
+        std::queue<Pos>  q;
+        dist[idx(src)] = 0; prev[idx(src)] = src; q.push(src);
+
+        while (!q.empty()) {
+            Pos u = q.front(); q.pop();
+            if (u == dst) break;
+            for (auto d : dirs) {
+                Pos v = Feis::GetNeighborCellPosition(u, d);
+                if (!Feis::IsWithinBoard(v) || dist[idx(v)] >= 0) continue;
+                if (auto fg = info.GetLayeredCell(v).GetForeground())
+                    if (!dynamic_cast<const Feis::ConveyorCell*>(fg.get()))
+                        continue;
+                if (auto bg = info.GetLayeredCell(v).GetBackground())
+                    if (dynamic_cast<const Feis::NumberCell*>(bg.get()))
+                        continue;
+                dist[idx(v)] = dist[idx(u)] + 1;
+                prev[idx(v)] = u;
+                q.push(v);
+            }
+        }
+        if (dist[idx(dst)] < 0) return {};
+        std::vector<Pos> path;
+        for (Pos cur = dst; cur != src; cur = prev[idx(cur)])
+            path.push_back(cur);
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+
+    // 4) 单点逻辑： machine + conveyors
+    void ProcessMine(
+        const Feis::IGameInfo& info,
+        Pos m,
+        std::vector<Pos>& builtConveyors,
+        const std::vector<std::pair<Pos,Pos>>& centerEntrances)
+    {
+        // BFS 从 m 找到最近 conveyor 或 centerEntrance
+        std::vector<int> dist(H*W, -1);
+        std::vector<Pos> prev(H*W);
+        std::queue<Pos>  q;
+        dist[idx(m)] = 0; prev[idx(m)] = m; q.push(m);
+
+        Pos convPos{-1,-1}, cenPos{-1,-1}, cenCenter{-1,-1};
+        bool foundConv=false, foundCen=false;
+
+        while (!q.empty() && (!foundConv||!foundCen)) {
+            Pos u = q.front(); q.pop();
+            int dcur = dist[idx(u)];
+            // check conveyor
+            if (!foundConv) {
+                bool isConv = false;
+                if (auto fg = info.GetLayeredCell(u).GetForeground())
+                    if (dynamic_cast<const Feis::ConveyorCell*>(fg.get()))
+                        isConv = true;
+                for (auto &bc: builtConveyors)
+                    if (bc==u) { isConv=true; break; }
+                if (isConv) { convPos=u; foundConv=true; }
+            }
+            // check centerEntrance
+            if (!foundCen) {
+                for (auto &tp : centerEntrances) {
+                    if (tp.first == u) {
+                        cenPos = u;
+                        cenCenter = tp.second;
+                        foundCen = true;
+                        break;
+                    }
+                }
+            }
+            if (foundConv && foundCen) break;
+            // extend
+            for (auto d : dirs) {
+                Pos v = Feis::GetNeighborCellPosition(u, d);
+                if (!Feis::IsWithinBoard(v) || dist[idx(v)]>=0) continue;
+                if (auto fg2 = info.GetLayeredCell(v).GetForeground())
+                    if (!dynamic_cast<const Feis::ConveyorCell*>(fg2.get()))
+                        continue;
+                if (auto bg2 = info.GetLayeredCell(v).GetBackground())
+                    if (dynamic_cast<const Feis::NumberCell*>(bg2.get()))
+                        continue;
+                dist[idx(v)] = dcur + 1;
+                prev[idx(v)] = u;
+                q.push(v);
+            }
+        }
+
+        int dConv = foundConv? dist[idx(convPos)] : INT_MAX;
+        int dCen  = foundCen?  dist[idx(cenPos)]  : INT_MAX;
+        bool useConv = (dConv <= dCen);
+        Pos endPos  = useConv? convPos : cenPos;
+        Pos linkEnd = useConv? convPos : cenCenter;
+        if (endPos.row<0) return;
+
+        // 重建 path
+        std::vector<Pos> path;
+        for (Pos cur=endPos; cur!=m; cur=prev[idx(cur)])
+            path.push_back(cur);
+        std::reverse(path.begin(), path.end());
+        if (path.empty()) return;
+
+        // build machine
+        Feis::Direction d0 = dirs[0];
+        for (auto d:dirs)
+            if (Feis::GetNeighborCellPosition(m,d)==path[0]) {
+                d0=d; break;
+            }
+        actions_.push_back({ MachineType(d0), m });
+
+        // build conveyors
+        for (size_t i=0;i<path.size();++i) {
+            Pos src = path[i];
+            Pos dst = (i+1<path.size()? path[i+1] : linkEnd);
+            Feis::Direction di=dirs[0];
+            for (auto d:dirs)
+                if (Feis::GetNeighborCellPosition(src,d)==dst) {
+                    di=d; break;
+                }
+            actions_.push_back({ ConveyorType(di), src });
+            builtConveyors.push_back(src);
+        }
+    }
+
+    // 5) Combiner 兜底：cbmines 两两配对
+    void ProcessCombiners(
+        const Feis::IGameInfo &info,
+        const std::vector<Pos> &cbmines,
+        std::vector<Pos>       &builtConveyors,
+        const std::vector<std::pair<Pos,Pos>> &centerEntrances)
+    {
+        int N = cbmines.size();
+        if (N<2) return;
+        // 1) 找第一对可得分 m1,m2
+        Pos m1{-1,-1}, m2{-1,-1};
+        bool found=false;
+        for (int i=0;i<N&&!found;i++){
+            int v1 = dynamic_cast<const Feis::NumberCell*>(
+                         info.GetLayeredCell(cbmines[i]).GetBackground().get())->GetNumber();
+            for(int j=i+1;j<N;j++){
+                int v2 = dynamic_cast<const Feis::NumberCell*>(
+                             info.GetLayeredCell(cbmines[j]).GetBackground().get())->GetNumber();
+                if(info.IsScoredProduct(v1+v2)){
+                    m1 = cbmines[i];
+                    m2 = cbmines[j];
+                    found=true; break;
+                }
+            }
+        }
+        if(!found) return;
+
+        // 2) 选 anchor
+        int top  = Feis::GameManager::CollectionCenterConfig::kTop;
+        int left = Feis::GameManager::CollectionCenterConfig::kLeft;
+        Pos center{top+G/2,left+G/2};
+        auto dc=[&](Pos a){return abs(a.row-center.row)+abs(a.col-center.col);};
+        Pos anchor = dc(m1)<dc(m2)?m1:m2;
+
+        // 3) 找 combPos, combDir
+        Pos combPos{-1,-1}; Feis::Direction combDir=dirs[0];
+        const std::array<std::pair<int,int>,4> offs = {{ {-1,0},{0,1},{1,0},{0,-1} }};
+        for(auto [dr,dc]:offs){
+            Pos c1{anchor.row+dr,anchor.col+dc};
+            Pos c2{anchor.row-dr,anchor.col-dc};
+            if(!Feis::IsWithinBoard(c1)||!Feis::IsWithinBoard(c2)) continue;
+            if(info.GetLayeredCell(c1).GetForeground()) continue;
+            if(info.GetLayeredCell(c2).GetForeground()) continue;
+            combPos = c1;
+            int vdr=c2.row-c1.row, vdc=c2.col-c1.col;
+            if     (vdr==-1&&vdc==0) combDir=Feis::Direction::kTop;
+            else if(vdr==1&&vdc==0) combDir=Feis::Direction::kBottom;
+            else if(vdr==0&&vdc==-1) combDir=Feis::Direction::kLeft;
+            else if(vdr==0&&vdc==1) combDir=Feis::Direction::kRight;
+            break;
+        }
+        if(combPos.row<0) return;
+
+        // 4) 放合成器
+        actions_.push_back({ CombinerType(combDir), combPos });
+
+        // 5) 铺带到入口
+        auto opp=[&](Feis::Direction d){
+            switch(d){
+              case Feis::Direction::kTop:    return Feis::Direction::kBottom;
+              case Feis::Direction::kBottom: return Feis::Direction::kTop;
+              case Feis::Direction::kLeft:   return Feis::Direction::kRight;
+              case Feis::Direction::kRight:  return Feis::Direction::kLeft;
+            }
+            return d;
+        };
+        Pos combInput = Feis::GetNeighborCellPosition(combPos, opp(combDir));
+        auto buildStraight=[&](const std::vector<Pos>& path){
+            for(size_t i=0;i+1<path.size();i++){
+                Pos u=path[i],v=path[i+1];
+                int dr=v.row-u.row, dc=v.col-u.col;
+                Feis::Direction di=dirs[0];
+                if(dr==-1&&dc==0) di=Feis::Direction::kTop;
+                else if(dr==1&&dc==0) di=Feis::Direction::kBottom;
+                else if(dr==0&&dc==-1) di=Feis::Direction::kLeft;
+                else if(dr==0&&dc==1) di=Feis::Direction::kRight;
+                actions_.push_back({ ConveyorType(di), u });
+                builtConveyors.push_back(u);
+            }
+        };
+        auto tryConn=[&](Pos m){
+            auto p=bfsBetween(info,m,combInput);
+            if(p.empty()) return false;
+            buildStraight(p);
+            return true;
+        };
+        if(!tryConn(m1)&&!tryConn(m2)) return;
+
+        // 6) 铺带到中心入口
+        Pos combExit = Feis::GetNeighborCellPosition(combPos, combDir);
+        Pos ent,ctr;
+        auto tail = bfsBetween(info, combExit, centerEntrances[0].first);
+        buildStraight(tail);
+    }
+
+    void initialize(const Feis::IGameInfo &info) {
+        auto centerEntrances = GetCenterEntrances(info);
+        std::vector<Pos> cbmines;
+        auto mines = GetScoredMines(info, cbmines);
+        std::vector<Pos> builtConveyors;
+
+        // 3) 单点流程
+        for (auto m : mines) {
+            ProcessMine(info, m, builtConveyors, centerEntrances);
+        }
+        // 4) Combiner 兜底
+        ProcessCombiners(info, cbmines, builtConveyors, centerEntrances);
+
+        initialized_ = true;
+    }
+
+public:
+    Feis::PlayerAction GetNextAction(const Feis::IGameInfo &info) override {
+        if (!initialized_) initialize(info);
+        if (action_index_ < actions_.size()) {
+            auto a = actions_[action_index_++];
+            return { a.type, a.pos };
+        }
+        return { Feis::PlayerActionType::None, {0,0} };
+    }
+};
