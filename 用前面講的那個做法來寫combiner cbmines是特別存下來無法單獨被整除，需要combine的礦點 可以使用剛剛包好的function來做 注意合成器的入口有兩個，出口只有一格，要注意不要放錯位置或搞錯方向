@@ -1,0 +1,168 @@
+class GamePlayer final : public Feis::IGamePlayer {
+private:
+    using Pos = Feis::CellPosition;
+    struct Action { Feis::PlayerActionType type; Pos pos; };
+    std::vector<Action> actions_;
+    size_t action_index_ = 0;
+    bool initialized_ = false;
+
+    static constexpr int H = Feis::GameManagerConfig::kBoardHeight;
+    static constexpr int W = Feis::GameManagerConfig::kBoardWidth;
+    static constexpr int G = Feis::GameManagerConfig::kGoalSize;
+    static const std::array<Feis::Direction,4> dirs;
+
+    inline int idx(Pos p) const { return p.row*W + p.col; }
+
+    // -------------------- Combiner 兜底逻辑 --------------------
+
+    // 对 cbmines 里所有点，两两尝试合并，只做第一个可行对
+    void ProcessCombiners(
+        const Feis::IGameInfo &info,
+        const std::vector<Pos> &cbmines,
+        std::vector<Pos>       &builtConveyors,
+        const std::vector<std::pair<Pos,Pos>> &centerEntrances
+    ) {
+        // 至少要两格数字
+        int N = cbmines.size();
+        if (N < 2) return;
+
+        // 1) 找第一对 v1+v2 可得分的 (m1, m2)
+        Pos m1{-1,-1}, m2{-1,-1};
+        bool foundPair = false;
+        for (int i = 0; i < N && !foundPair; ++i) {
+            int v1 = dynamic_cast<const Feis::NumberCell*>(
+                         info.GetLayeredCell(cbmines[i]).GetBackground().get()
+                     )->GetNumber();
+            for (int j = i+1; j < N; ++j) {
+                int v2 = dynamic_cast<const Feis::NumberCell*>(
+                             info.GetLayeredCell(cbmines[j]).GetBackground().get()
+                         )->GetNumber();
+                if (info.IsScoredProduct(v1 + v2)) {
+                    m1 = cbmines[i];
+                    m2 = cbmines[j];
+                    foundPair = true;
+                    break;
+                }
+            }
+        }
+        if (!foundPair) return;
+
+        // 2) 选更靠近中心的那个做 anchor
+        int top  = Feis::GameManager::CollectionCenterConfig::kTop;
+        int left = Feis::GameManager::CollectionCenterConfig::kLeft;
+        Pos center{ top + G/2, left + G/2 };
+        auto distC = [&](Pos a){ return std::abs(a.row-center.row) + std::abs(a.col-center.col); };
+        Pos anchor = (distC(m1) < distC(m2) ? m1 : m2);
+
+        // 3) 在 anchor 四个正交方向找对称空格，确定 combPos & combDir
+        Pos combPos{-1,-1};
+        Feis::Direction combDir = Feis::Direction::kTop;
+        const std::array<std::pair<int,int>,4> offs = {{
+            {-1,0},{0,1},{1,0},{0,-1}
+        }};
+        for (auto [dr,dc] : offs) {
+            Pos c1{ anchor.row+dr, anchor.col+dc };
+            Pos c2{ anchor.row-dr, anchor.col-dc };
+            if (!Feis::IsWithinBoard(c1) || !Feis::IsWithinBoard(c2)) continue;
+            if (info.GetLayeredCell(c1).GetForeground()) continue;
+            if (info.GetLayeredCell(c2).GetForeground()) continue;
+            // 确定主单元 c1, 次单元 c2
+            combPos = c1;
+            int vdr = c2.row - c1.row, vdc = c2.col - c1.col;
+            if      (vdr==-1&&vdc== 0) combDir = Feis::Direction::kTop;
+            else if (vdr== 1&&vdc== 0) combDir = Feis::Direction::kBottom;
+            else if (vdr== 0&&vdc==-1) combDir = Feis::Direction::kLeft;
+            else if (vdr== 0&&vdc== 1) combDir = Feis::Direction::kRight;
+            break;
+        }
+        if (combPos.row < 0) return;  // 放不下放弃
+
+        // 4) 放合成器
+        actions_.push_back({ CombinerType(combDir), combPos });
+
+        // 5) 铺带到 Combiner 的入口（入口在主单元的反方向）
+        auto opposite = [&](Feis::Direction d){
+            switch(d){
+                case Feis::Direction::kTop:    return Feis::Direction::kBottom;
+                case Feis::Direction::kBottom: return Feis::Direction::kTop;
+                case Feis::Direction::kLeft:   return Feis::Direction::kRight;
+                case Feis::Direction::kRight:  return Feis::Direction::kLeft;
+            }
+            return d;
+        };
+        Pos combMain  = combPos;
+        Pos combInput = Feis::GetNeighborCellPosition(combMain, opposite(combDir));
+
+        // 统一直线铺带 lambda
+        auto buildStraight = [&](const std::vector<Pos>& path){
+            for (size_t i = 0; i+1 < path.size(); ++i) {
+                Pos u = path[i], v = path[i+1];
+                int dr = v.row - u.row, dc = v.col - u.col;
+                Feis::Direction di = dirs[0];
+                if      (dr==-1&&dc== 0) di = Feis::Direction::kTop;
+                else if (dr== 1&&dc== 0) di = Feis::Direction::kBottom;
+                else if (dr== 0&&dc==-1) di = Feis::Direction::kLeft;
+                else if (dr== 0&&dc== 1) di = Feis::Direction::kRight;
+                else continue;
+                actions_.push_back({ ConveyorType(di), u });
+                builtConveyors.push_back(u);
+            }
+        };
+
+        // BFS helper 已经拆成 bfsBetween
+        // tryConnect(m) 铺 m->combInput
+        auto tryConnect = [&](Pos m){
+            auto path = bfsBetween(info, m, combInput);
+            if (path.empty()) return false;
+            buildStraight(path);
+            return true;
+        };
+        if (!tryConnect(m1) && !tryConnect(m2)) return;
+
+        // 6) 从 Combiner 出口铺到最近的中心入口
+        Pos combExit = Feis::GetNeighborCellPosition(combMain, combDir);
+        Pos ent, ctr;
+        auto tail = getPathToAny(combExit, ent, ctr);
+        buildStraight(tail);
+    }
+
+    // 其余 helper（GetCenterEntrances、GetScoredMines、bfsBetween、getPathToAny）保持不变，
+    // 前面已经在类里定义好，可以直接调用。
+
+    void initialize(const Feis::IGameInfo &info) {
+        // 1) 中心入口
+        auto centerEntrances = GetCenterEntrances(info);
+        // 2) 可得分矿点 & 需合并矿点
+        std::vector<Pos> cbmines;
+        auto mines = GetScoredMines(info);  
+        // 已在 GetScoredMines 里把未得分的推入 cbmines
+
+        // 3) 对每个可单独得分的矿点，原版流程
+        std::vector<Pos> builtConveyors;
+        for (auto m : mines) {
+            ProcessMine(info, m, builtConveyors, centerEntrances);
+        }
+
+        // 4) 兜底合并所有 cbmines
+        ProcessCombiners(info, cbmines, builtConveyors, centerEntrances);
+
+        initialized_ = true;
+    }
+
+public:
+    Feis::PlayerAction GetNextAction(const Feis::IGameInfo &info) override {
+        if (!initialized_) initialize(info);
+        if (action_index_ < actions_.size()) {
+            auto a = actions_[action_index_++];
+            return { a.type, a.pos };
+        }
+        return { Feis::PlayerActionType::None, {0,0} };
+    }
+};
+
+constexpr std::array<Feis::Direction,4> GamePlayer::dirs = {
+    Feis::Direction::kLeft,
+    Feis::Direction::kTop,
+    Feis::Direction::kRight,
+    Feis::Direction::kBottom
+};
